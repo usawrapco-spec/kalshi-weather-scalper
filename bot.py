@@ -41,7 +41,19 @@ STARTING_BALANCE = 10000.00
 CASH_RESERVE = 0.30
 TAKER_FEE_RATE = 0.07
 MAX_HOURS_TO_EXPIRY = 8      # only buy contracts expiring within 8 hours
-MIN_CONFIDENCE = 0.90         # need 90% confidence the outcome is decided
+MIN_CONFIDENCE = 0.85         # need 85% confidence the outcome is decided
+
+# UTC offsets for each city (standard time / daylight time)
+# Used for accurate local hour estimation
+CITY_UTC_OFFSET = {
+    'NYC': -5, 'LGA': -5, 'CHI': -6, 'ORD': -6, 'LA': -8, 'MIA': -5,
+    'DEN': -7, 'ATL': -5, 'DFW': -6, 'DAL': -6, 'SEA': -8, 'PHX': -7,
+    'DCA': -5, 'BOS': -5, 'CLT': -5, 'DTW': -5, 'HOU': -6, 'JAX': -5,
+    'LAS': -8, 'MSP': -6, 'BNA': -6, 'MSY': -6, 'OKC': -6, 'PHL': -5,
+    'AUS': -6, 'SAT': -6, 'SFO': -8, 'TPA': -5, 'BKF': -7,
+}
+# DST: Most US cities spring forward (except PHX). Mar-Nov add 1 hour.
+DST_EXEMPT = {'PHX'}  # Arizona doesn't do DST
 
 # All KXHIGH series
 TEMP_SERIES = {
@@ -60,7 +72,6 @@ TEMP_SERIES = {
     'KXHIGHAUS': 'AUS', 'KXHIGHSAT': 'SAT',
     'KXHIGHSFO': 'SFO', 'KXHIGHTPA': 'TPA',
     'KXHIGHBKF': 'BKF',
-    # NHIGH variants
     'NHIGHNY': 'NYC', 'NHIGHLGA': 'LGA',
     'NHIGHCHI': 'ORD', 'NHIGHMDW': 'CHI',
     'NHIGHLA': 'LA', 'NHIGHMIA': 'MIA',
@@ -248,10 +259,25 @@ def get_open_positions():
         conn.close()
 
 
+# === LOCAL TIME HELPER ===
+
+def get_local_hour(city_key):
+    """Get approximate local hour for a city, accounting for DST."""
+    now = datetime.now(timezone.utc)
+    offset = CITY_UTC_OFFSET.get(city_key, -6)
+
+    # Simple DST check: second Sunday in March to first Sunday in November
+    month = now.month
+    if city_key not in DST_EXEMPT and 3 <= month <= 10:
+        offset += 1  # DST: spring forward
+
+    local_hour = (now.hour + offset) % 24
+    return local_hour
+
+
 # === SCALPING LOGIC ===
 
 def parse_market(ticker):
-    """Parse ticker to get city and threshold. Returns (city_key, threshold) or None."""
     ticker_upper = ticker.upper()
     for prefix, city in TEMP_SERIES.items():
         if ticker_upper.startswith(prefix):
@@ -265,10 +291,8 @@ def assess_confidence(city_key, threshold, side):
     """Determine confidence that this contract will settle in our favor.
 
     Uses real-time observations: if the daily high already exceeded the
-    threshold, "yes above" is a lock. If it's late in the day and temps
+    threshold, "yes above" is a lock. If it's late afternoon and temps
     are falling well below, "no above" is a lock.
-
-    Returns confidence 0.0 to 1.0
     """
     if city_key not in current_obs:
         return 0.0
@@ -276,24 +300,16 @@ def assess_confidence(city_key, threshold, side):
     obs = current_obs[city_key]
     current_temp = obs.get('temp_f')
     day_high = obs.get('day_high_f')
-    day_low = obs.get('day_low_f')
 
     if current_temp is None:
         return 0.0
 
-    now = datetime.now(timezone.utc)
-    hour_utc = now.hour
-
-    # Estimate local afternoon progress (rough)
-    # Most highs occur 2-4pm local. After that, temps fall.
-    # We use a simple heuristic based on UTC hour and station longitude
-    lon = STATIONS.get(city_key, {}).get('lon', -90)
-    local_hour_approx = (hour_utc + lon / 15) % 24  # rough solar time
+    local_hour = get_local_hour(city_key)
 
     if side == 'yes':
-        # We're betting the high WILL be >= threshold
+        # Betting the high WILL be >= threshold
 
-        # Already hit it today? Lock.
+        # Already hit today? Lock.
         if day_high is not None and day_high >= threshold:
             return 0.99
 
@@ -301,51 +317,64 @@ def assess_confidence(city_key, threshold, side):
         if current_temp >= threshold:
             return 0.97
 
-        # Current temp close and it's still warming up (before 3pm local)
-        if current_temp >= threshold - 2 and local_hour_approx < 15:
-            return 0.85
+        # Close and still warming (before 3pm)
+        if current_temp >= threshold - 2 and local_hour < 15:
+            return 0.88
 
-        # Current temp close but afternoon is winding down
-        if current_temp >= threshold - 3 and local_hour_approx < 14:
-            return 0.75
+        # Within 3F and early afternoon
+        if current_temp >= threshold - 3 and local_hour < 14:
+            return 0.80
 
-        # It's past peak and we haven't hit it — unlikely
-        if local_hour_approx >= 17 and day_high is not None and day_high < threshold - 3:
+        # Within 5F and still morning
+        if current_temp >= threshold - 5 and local_hour < 12:
+            return 0.65
+
+        # Late day, hasn't hit, unlikely
+        if local_hour >= 17 and day_high is not None and day_high < threshold - 3:
             return 0.05
 
-        return 0.3  # uncertain
+        if local_hour >= 16 and day_high is not None and day_high < threshold:
+            return 0.15
+
+        return 0.3
 
     else:
-        # We're betting the high will NOT reach threshold (side=no)
+        # Betting the high will NOT reach threshold (side=no)
 
-        # It already hit — we lose
+        # Already hit — we lose
         if day_high is not None and day_high >= threshold:
             return 0.01
 
-        # Current temp already above — we lose
         if current_temp >= threshold:
             return 0.02
 
-        # It's late afternoon and temp is well below — lock
-        if local_hour_approx >= 17 and current_temp < threshold - 5:
-            return 0.97
+        # Late afternoon, well below — lock
+        if local_hour >= 16 and current_temp < threshold - 3:
+            return 0.96
 
-        if local_hour_approx >= 16 and current_temp < threshold - 8:
+        if local_hour >= 17 and current_temp < threshold - 2:
             return 0.95
 
-        # Morning still, too early to call
-        if local_hour_approx < 12 and current_temp < threshold - 5:
-            return 0.60
+        # Past peak, decent buffer
+        if local_hour >= 15 and current_temp < threshold - 4:
+            return 0.90
 
-        # Afternoon, some buffer
-        if local_hour_approx >= 14 and current_temp < threshold - 3:
+        # Afternoon, moderate buffer
+        if local_hour >= 14 and current_temp < threshold - 5:
+            return 0.85
+
+        # Early afternoon, big buffer
+        if local_hour >= 13 and current_temp < threshold - 8:
             return 0.80
+
+        # Morning, too early
+        if local_hour < 12 and current_temp < threshold - 10:
+            return 0.60
 
         return 0.3
 
 
 def check_sells():
-    """Check positions for settlement or take-profit."""
     logger.info("--- SELL CHECK ---")
     positions = get_open_positions()
     if not positions:
@@ -374,7 +403,8 @@ def check_sells():
         if result_val:
             buy_fee = kalshi_fee(entry, count)
             if result_val == side:
-                pnl = round((1.0 - entry) * count - buy_fee, 4)
+                sell_fee = kalshi_fee(1.0, count)
+                pnl = round((1.0 - entry) * count - buy_fee - sell_fee, 4)
             else:
                 pnl = round(-entry * count - buy_fee, 4)
             logger.info(f"SETTLED: {ticker} {side} {'WIN' if pnl > 0 else 'LOSS'} pnl=${pnl:.4f}")
@@ -390,20 +420,23 @@ def check_sells():
         if status in ('closed', 'settled', 'finalized'):
             continue
 
-        # Current bid
+        # Current bid — only update if > 0
         if side == 'yes':
             bid = sf(market.get('yes_bid_dollars', '0'))
         else:
             bid = sf(market.get('no_bid_dollars', '0'))
 
-        conn = get_db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE trades SET current_bid = %s WHERE id = %s", (float(bid), trade['id']))
-        except:
-            pass
-        finally:
-            conn.close()
+        if bid > 0:
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE trades SET current_bid = %s WHERE id = %s", (float(bid), trade['id']))
+            except:
+                pass
+            finally:
+                conn.close()
+        else:
+            bid = sf(trade.get('current_bid', 0))  # keep last known bid
 
         if bid <= 0:
             continue
@@ -430,7 +463,6 @@ def check_sells():
 
 
 def fetch_weather_markets():
-    """Fetch all open weather markets."""
     all_markets = []
     fetched = set()
     for series in ALL_SERIES:
@@ -456,7 +488,6 @@ def fetch_weather_markets():
 
 
 def buy_candidates(markets):
-    """Scalp cheap near-expiry contracts where outcome is ~certain."""
     balance = get_balance()
     positions = get_open_positions()
     logger.info(f"Balance: ${balance:.2f} | {len(positions)} open")
@@ -479,7 +510,6 @@ def buy_candidates(markets):
 
     for market in markets:
         ticker = market.get('ticker', '')
-
         city_key, threshold = parse_market(ticker)
         if not city_key or not threshold:
             continue
@@ -487,7 +517,6 @@ def buy_candidates(markets):
         if ticker_counts.get(ticker, 0) >= MAX_PER_TICKER:
             continue
 
-        # Check expiry
         close_time = market.get('close_time') or market.get('expected_expiration_time', '')
         if not close_time:
             continue
@@ -502,7 +531,6 @@ def buy_candidates(markets):
         yes_ask = float(market.get('yes_ask_dollars') or '999')
         no_ask = float(market.get('no_ask_dollars') or '999')
 
-        # Try both sides — buy cheapest with high confidence
         for side, ask in [('yes', yes_ask), ('no', no_ask)]:
             if not (BUY_MIN <= ask <= BUY_MAX):
                 continue
@@ -513,11 +541,8 @@ def buy_candidates(markets):
 
             obs = current_obs.get(city_key, {})
             candidates.append({
-                'ticker': ticker,
-                'side': side,
-                'price': ask,
-                'confidence': confidence,
-                'city': city_key,
+                'ticker': ticker, 'side': side, 'price': ask,
+                'confidence': confidence, 'city': city_key,
                 'station': STATIONS.get(city_key, {}).get('icao', ''),
                 'threshold': threshold,
                 'current_temp': obs.get('temp_f', 0),
@@ -525,7 +550,6 @@ def buy_candidates(markets):
                 'hours_left': hours_left,
             })
 
-    # Sort: cheapest first (more upside), then highest confidence
     candidates.sort(key=lambda x: (x['price'], -x['confidence']))
     logger.info(f"Found {len(candidates)} scalp candidates (>={MIN_CONFIDENCE*100:.0f}% confidence)")
 
@@ -606,9 +630,7 @@ def run_cycle():
         logger.info("Fetching real-time NWS observations...")
         current_obs = fetch_all_observations()
         for city, obs in sorted(current_obs.items()):
-            temp = obs.get('temp_f', '?')
-            high = obs.get('day_high_f', '?')
-            logger.info(f"  {city}({obs.get('station','?')}): now={temp}F high={high}F")
+            logger.info(f"  {city}({obs.get('station','?')}): now={obs.get('temp_f', '?')}F high={obs.get('day_high_f', '?')}F")
 
     check_sells()
     markets = fetch_weather_markets()
@@ -619,11 +641,12 @@ def run_cycle():
     logger.info(f"=== CYCLE END [{mode}] === Balance: ${balance:.2f}")
 
 
-# === API ===
+# === DASHBOARD API ===
 
 @app.route('/')
 def health():
     return 'OK'
+
 
 @app.route('/api/status')
 def api_status():
@@ -637,15 +660,20 @@ def api_status():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT pnl FROM trades WHERE action='buy' AND pnl IS NOT NULL")
                 resolved = cur.fetchall()
+                cur.execute("SELECT count, price FROM trades WHERE action = 'buy'")
+                all_buys = cur.fetchall()
         finally:
             conn.close()
 
         total_pnl = sum(sf(t['pnl']) for t in resolved)
         wins = sum(1 for t in resolved if sf(t['pnl']) > 0)
         losses = sum(1 for t in resolved if sf(t['pnl']) <= 0)
+        win_rate = round(wins / max(wins + losses, 1) * 100, 1)
         avg_win = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) > 0) / max(wins, 1), 4)
         avg_loss = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) <= 0) / max(losses, 1), 4)
-        win_rate = round(wins / max(wins + losses, 1) * 100, 1)
+        total_contracts = sum((t.get('count') or 1) for t in all_buys)
+        total_fees = round(sum(kalshi_fee(sf(t.get('price')), t.get('count') or 1) for t in all_buys), 4)
+
         round_cost = sum(sf(t.get('price')) * (t.get('count') or 1) for t in positions)
         round_pnl = round(pos_val - round_cost, 4)
         round_pct = round((round_pnl / round_cost * 100), 1) if round_cost > 0 else 0
@@ -654,10 +682,11 @@ def api_status():
 
         return jsonify({
             'portfolio': round(cash + pos_val, 2), 'cash': round(cash, 2),
-            'positions_value': round(pos_val, 2), 'overall_pnl': overall,
-            'overall_pct': overall_pct,
+            'positions_value': round(pos_val, 2),
+            'overall_pnl': overall, 'overall_pct': overall_pct,
             'round_pnl': round_pnl, 'round_pct': round_pct,
-            'net_pnl': round(total_pnl, 4),
+            'net_pnl': round(total_pnl, 4), 'total_fees': total_fees,
+            'total_contracts': total_contracts,
             'wins': wins, 'losses': losses, 'win_rate': win_rate,
             'avg_win': avg_win, 'avg_loss': avg_loss,
             'open_count': len(positions),
@@ -667,6 +696,7 @@ def api_status():
     except Exception as e:
         logger.error(f"API status error: {e}")
         return jsonify({'portfolio': 0, 'cash': 0, 'mode': 'PAPER'})
+
 
 @app.route('/api/open')
 def api_open():
@@ -694,6 +724,7 @@ def api_open():
     except:
         return jsonify([])
 
+
 @app.route('/api/trades')
 def api_trades():
     try:
@@ -708,6 +739,7 @@ def api_trades():
             'created_at': str(t.get('created_at', '')), 'ticker': t.get('ticker', ''),
             'side': t.get('side', ''), 'city': t.get('city', ''),
             'confidence': sf(t.get('confidence')),
+            'count': t.get('count', 1),
             'entry': sf(t.get('price')), 'exit': sf(t.get('current_bid')),
             'pnl': sf(t.get('pnl')),
             'gain_pct': round(((sf(t.get('current_bid')) - sf(t.get('price'))) / sf(t.get('price'))) * 100, 1) if sf(t.get('price')) > 0 else 0,
@@ -715,9 +747,11 @@ def api_trades():
     except:
         return jsonify([])
 
+
 @app.route('/api/hot')
 def api_hot():
     return jsonify(current_hot_markets)
+
 
 @app.route('/api/observations')
 def api_observations():
@@ -730,161 +764,189 @@ def api_observations():
             'day_high_f': obs.get('day_high_f'),
             'day_low_f': obs.get('day_low_f'),
             'wind_mph': obs.get('wind_mph'),
-            'humidity': obs.get('humidity'),
             'observed_at': obs.get('observed_at', ''),
         }
     return jsonify(result)
 
+
 @app.route('/dashboard')
 def dashboard():
     return DASHBOARD_HTML
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Weather Scalper</title>
+<title>Weather Scalper Terminal</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg:#f4f6fb;--bg1:#ffffff;--bg2:#f0f2f8;--bg3:#e8ecf4;
-  --border:#d8dde8;--border2:#c8d0e0;
-  --text:#1a2030;--text2:#5a6478;--text3:#8890a4;
-  --green:#0d9f5f;--red:#d63050;--gold:#c08000;
-  --blue:#2a6fd6;--cyan:#1898b0;--purple:#6050c8;
-  --sky:#2878d0;--orange:#d06820;
+  --bg:#06080d;--bg1:#0c1017;--bg2:#111820;--bg3:#1a2130;
+  --border:#1a2235;--border2:#243050;
+  --text:#c8d0e0;--text2:#6a7490;--text3:#3a4260;
+  --green:#00e68a;--green2:#00cc7a;--green-bg:rgba(0,230,138,.06);
+  --red:#ff4466;--red2:#ee3355;--red-bg:rgba(255,68,102,.06);
+  --gold:#f0b040;--gold2:#e0a030;--gold-bg:rgba(240,176,64,.08);
+  --blue:#4488ff;--cyan:#40d0e0;
 }
 body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column}
-::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.animate-num{transition:all .4s cubic-bezier(.4,0,.2,1)}
 
-.header{background:var(--bg1);border-bottom:1px solid var(--border);padding:12px 28px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 1px 4px rgba(0,0,0,.06);position:relative}
-.header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--red),var(--orange));opacity:.5}
-.h-left{display:flex;align-items:center;gap:14px}
-.brand{font-size:14px;font-weight:800;color:var(--orange);letter-spacing:2px;text-transform:uppercase}
-.brand-sub{font-size:9px;color:var(--text3);letter-spacing:3px;text-transform:uppercase}
-.live-dot{width:8px;height:8px;border-radius:50%;animation:pulse 2s ease infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;animation:pulse 1.8s ease-in-out infinite;vertical-align:middle}
 .dot-paper{background:var(--gold);box-shadow:0 0 8px var(--gold)}
 .dot-live{background:var(--green);box-shadow:0 0 8px var(--green)}
-.mode-badge{font-size:9px;padding:3px 10px;border-radius:3px;font-weight:700;letter-spacing:1.5px}
-.mode-paper{background:#fef3d0;color:var(--gold);border:1px solid #e8d090}
-.h-right{display:flex;align-items:center;gap:16px;font-size:10px;color:var(--text2)}
-.h-pill{background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:9px;color:var(--text2)}
 
-.main{flex:1;padding:16px 24px;max-width:1800px;margin:0 auto;width:100%}
+.header-bar{background:var(--bg1);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.header-left{display:flex;align-items:center;gap:16px}
+.brand{font-size:13px;font-weight:700;color:var(--gold);letter-spacing:2px;text-transform:uppercase}
+.mode-badge{font-size:10px;padding:3px 10px;border-radius:3px;font-weight:600;letter-spacing:1px}
+.mode-paper{background:rgba(240,176,64,.15);color:var(--gold);border:1px solid rgba(240,176,64,.3)}
+.mode-live{background:rgba(0,230,138,.15);color:var(--green);border:1px solid rgba(0,230,138,.3)}
+.header-right{display:flex;align-items:center;gap:16px;font-size:10px;color:var(--text2)}
+.countdown-box{color:var(--gold);font-weight:700;font-size:12px}
 
-.hero{background:var(--bg1);border:1px solid var(--border);border-radius:10px;padding:28px;text-align:center;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.04);position:relative;overflow:hidden}
-.hero::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--orange),var(--red),var(--orange))}
-.hero-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:3px;margin-bottom:8px}
-.hero-val{font-size:48px;font-weight:800;letter-spacing:-2px}
-.hero-row{display:flex;justify-content:center;gap:40px;margin-top:16px;flex-wrap:wrap}
-.hero-item{text-align:center}
-.hero-item-label{font-size:8px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:3px}
-.hero-item-val{font-size:16px;font-weight:700}
+.main-wrap{flex:1;padding:16px 20px;max-width:1600px;margin:0 auto;width:100%}
+.grid-layout{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:1100px){.grid-layout{grid-template-columns:1fr}}
+.full-width{grid-column:1/-1}
 
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
-.stat{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
-.s-label{font-size:8px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px}
-.s-val{font-size:17px;font-weight:700}
+.hero-card{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:24px 32px;text-align:center;position:relative;overflow:hidden;margin-bottom:14px}
+.hero-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent)}
+.hero-label{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:2px;margin-bottom:6px}
+.hero-value{font-size:40px;font-weight:800;letter-spacing:-1px;line-height:1.1}
+.hero-sub{display:flex;justify-content:center;gap:32px;margin-top:14px;flex-wrap:wrap}
+.hero-sub-item{text-align:center}
+.hero-sub-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px}
+.hero-sub-value{font-size:15px;font-weight:600;margin-top:2px}
 
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:1200px){.grid{grid-template-columns:1fr}}
-.full{grid-column:1/-1}
+.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.stat-card{background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px 14px;position:relative;overflow:hidden}
+.stat-card::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px}
+.stat-card.accent-green::after{background:var(--green)}
+.stat-card.accent-red::after{background:var(--red)}
+.stat-card.accent-gold::after{background:var(--gold)}
+.stat-card.accent-blue::after{background:var(--blue)}
+.stat-card.accent-cyan::after{background:var(--cyan)}
+.stat-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.stat-value{font-size:15px;font-weight:700}
 
-.panel{background:var(--bg1);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.04)}
-.p-head{padding:12px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--bg2)}
-.p-head h2{font-size:11px;text-transform:uppercase;letter-spacing:2px;font-weight:700;color:var(--orange)}
-.p-head .badge{font-size:9px;color:var(--text2);background:var(--bg);padding:2px 8px;border-radius:3px;border:1px solid var(--border)}
-.p-body{max-height:420px;overflow-y:auto}
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+.panel-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--bg2)}
+.panel-header h2{color:var(--gold);font-size:11px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600;display:flex;align-items:center;gap:8px}
+.panel-header h2::before{content:'';display:inline-block;width:3px;height:12px;background:var(--gold);border-radius:1px}
+.panel-header .count{color:var(--text2);font-size:10px}
+.panel-body{max-height:380px;overflow-y:auto;flex:1}
+.panel-body::-webkit-scrollbar{width:4px}
+.panel-body::-webkit-scrollbar-track{background:var(--bg1)}
+.panel-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 
 table{width:100%;border-collapse:collapse;font-size:11px}
-th{color:var(--text2);text-align:left;padding:9px 12px;border-bottom:2px solid var(--border);text-transform:uppercase;font-size:8px;letter-spacing:1px;font-weight:700;position:sticky;top:0;background:var(--bg1)}
-td{padding:8px 12px;border-bottom:1px solid var(--border)}
-tr:hover{background:var(--bg2)}
-.green{color:var(--green)}.red{color:var(--red)}.gray{color:var(--text3)}.gold{color:var(--gold)}.sky{color:var(--sky)}.orange{color:var(--orange)}.purple{color:var(--purple)}
+th{color:var(--text3);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);text-transform:uppercase;font-size:9px;letter-spacing:.8px;font-weight:600;position:sticky;top:0;background:var(--bg1);z-index:1}
+td{padding:7px 10px;border-bottom:1px solid rgba(26,34,53,.5)}
+tr{transition:background .15s ease}
+tr:hover{background:var(--bg3) !important}
+.green{color:var(--green)}.red{color:var(--red)}.gray{color:var(--text3)}.gold{color:var(--gold)}.cyan{color:var(--cyan)}
 
-.obs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;padding:12px}
-.obs-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
-.obs-city{font-size:11px;font-weight:700;color:var(--orange)}
-.obs-station{font-size:8px;color:var(--text3);margin-bottom:4px}
-.obs-temp{font-size:22px;font-weight:800;color:var(--red)}
-.obs-detail{font-size:9px;color:var(--text2);margin-top:2px}
+.obs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;padding:12px}
+.obs-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+.obs-city{font-size:10px;font-weight:700;color:var(--gold)}
+.obs-station{font-size:8px;color:var(--text3)}
+.obs-temp{font-size:20px;font-weight:800;color:var(--red);margin:2px 0}
+.obs-detail{font-size:9px;color:var(--text2)}
 
-.empty{color:var(--text3);text-align:center;padding:24px;font-size:11px;font-style:italic}
-.footer{background:var(--bg1);border-top:1px solid var(--border);padding:8px 28px;font-size:9px;color:var(--text2)}
+.status-bar{background:var(--bg1);border-top:1px solid var(--border);padding:8px 24px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:10px;color:var(--text3)}
+.empty-state{color:var(--text3);text-align:center;padding:24px;font-size:11px;font-style:italic}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <div class="h-left">
-    <div><div class="brand">Weather Scalper</div><div class="brand-sub">Near-Expiry Sniper</div></div>
+<div class="header-bar">
+  <div class="header-left">
+    <span class="brand">Weather Scalper</span>
     <span class="live-dot dot-paper" id="mode-dot"></span>
-    <span class="mode-badge mode-paper" id="mode-badge">PAPER</span>
+    <span class="mode-badge mode-paper" id="mode-badge">PAPER MODE</span>
   </div>
-  <div class="h-right">
-    <span class="h-pill">Buy $0.01-$0.50</span><span>|</span>
-    <span class="h-pill">Sell +150%</span><span>|</span>
-    <span class="h-pill">90% Confidence</span><span>|</span>
-    <span>Cycle <span id="hd-cycle">--</span></span>
-  </div>
-</div>
-
-<div class="main">
-
-<div class="hero">
-  <div class="hero-label">Overall Profit & Loss</div>
-  <div class="hero-val" id="hero-pnl">...</div>
-  <div class="hero-row">
-    <div class="hero-item"><div class="hero-item-label">Unrealized</div><div class="hero-item-val" id="h-unreal">--</div></div>
-    <div class="hero-item"><div class="hero-item-label">Realized</div><div class="hero-item-val" id="h-real">--</div></div>
-    <div class="hero-item"><div class="hero-item-label">Win Rate</div><div class="hero-item-val" id="h-wr">--</div></div>
-    <div class="hero-item"><div class="hero-item-label">Stations Live</div><div class="hero-item-val sky" id="h-stations">--</div></div>
+  <div class="header-right">
+    <span>Buy $0.01 - $0.50</span><span>|</span>
+    <span>Sell +150%</span><span>|</span>
+    <span>Confidence >= 85%</span><span>|</span>
+    <span>Cycle: <span class="countdown-box" id="hd-cycle">--</span></span>
   </div>
 </div>
 
-<div class="stats">
-  <div class="stat"><div class="s-label">Portfolio</div><div class="s-val sky" id="s-port">--</div></div>
-  <div class="stat"><div class="s-label">Cash</div><div class="s-val green" id="s-cash">--</div></div>
-  <div class="stat"><div class="s-label">Open</div><div class="s-val gold" id="s-open">--</div></div>
-  <div class="stat"><div class="s-label">Wins</div><div class="s-val green" id="s-wins">--</div></div>
-  <div class="stat"><div class="s-label">Losses</div><div class="s-val red" id="s-losses">--</div></div>
-  <div class="stat"><div class="s-label">Avg Win</div><div class="s-val green" id="s-avgw">--</div></div>
-  <div class="stat"><div class="s-label">Avg Loss</div><div class="s-val red" id="s-avgl">--</div></div>
-</div>
+<div class="main-wrap">
 
-<div class="grid" style="margin-bottom:14px">
-  <div class="panel">
-    <div class="p-head"><h2>Live Observations</h2><span class="badge" id="obs-count">--</span></div>
-    <div class="p-body" style="max-height:500px" id="obs-body"><div class="empty">Loading...</div></div>
-  </div>
-  <div class="panel">
-    <div class="p-head"><h2>Hot Markets</h2><span class="badge" id="hot-count">0</span></div>
-    <div class="p-body"><table><thead><tr><th>Market</th><th>Yes</th><th>No</th><th>Vol</th></tr></thead><tbody id="hot-tbody"></tbody></table></div>
+<div class="hero-card full-width">
+  <div class="hero-label">Overall Profit &amp; Loss</div>
+  <div class="hero-value animate-num" id="hero-pnl">...</div>
+  <div class="hero-sub">
+    <div class="hero-sub-item"><div class="hero-sub-label">Unrealized</div><div class="hero-sub-value animate-num" id="h-unreal">...</div></div>
+    <div class="hero-sub-item"><div class="hero-sub-label">Realized</div><div class="hero-sub-value animate-num" id="h-real">...</div></div>
+    <div class="hero-sub-item"><div class="hero-sub-label">Total Fees</div><div class="hero-sub-value animate-num" id="h-fees">...</div></div>
+    <div class="hero-sub-item"><div class="hero-sub-label">Win Rate</div><div class="hero-sub-value animate-num" id="h-wr">...</div></div>
+    <div class="hero-sub-item"><div class="hero-sub-label">Stations</div><div class="hero-sub-value animate-num cyan" id="h-stations">...</div></div>
   </div>
 </div>
 
-<div class="panel full" style="margin-bottom:14px">
-  <div class="p-head"><h2>Open Positions</h2><span class="badge" id="op-count">0</span></div>
-  <div class="p-body"><table><thead><tr><th>Ticker</th><th>Side</th><th>City</th><th>Temp Now</th><th>Day High</th><th>Thresh</th><th>Conf</th><th>Exp</th><th>Entry</th><th>Bid</th><th>P&L</th></tr></thead><tbody id="op-tbody"></tbody></table></div>
+<div class="stats-bar full-width">
+  <div class="stat-card accent-blue"><div class="stat-label">Cash</div><div class="stat-value" id="st-cash">--</div></div>
+  <div class="stat-card accent-gold"><div class="stat-label">Positions Value</div><div class="stat-value" id="st-posval">--</div></div>
+  <div class="stat-card accent-green"><div class="stat-label">Record</div><div class="stat-value" id="st-record">--</div></div>
+  <div class="stat-card accent-green"><div class="stat-label">Avg Win</div><div class="stat-value green" id="st-avgw">--</div></div>
+  <div class="stat-card accent-red"><div class="stat-label">Avg Loss</div><div class="stat-value red" id="st-avgl">--</div></div>
+  <div class="stat-card accent-cyan"><div class="stat-label">Contracts</div><div class="stat-value cyan" id="st-contracts">--</div></div>
+  <div class="stat-card accent-gold"><div class="stat-label">Open</div><div class="stat-value" id="st-open">--</div></div>
 </div>
 
-<div class="panel full">
-  <div class="p-head"><h2>Trade History</h2></div>
-  <div class="p-body"><table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>City</th><th>Conf</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="tr-tbody"></tbody></table></div>
+<div class="grid-layout">
+
+<!-- Live Observations -->
+<div class="panel full-width">
+  <div class="panel-header"><h2>Live Station Observations</h2><span class="count" id="obs-count">--</span></div>
+  <div class="panel-body" style="max-height:300px" id="obs-body"><div class="empty-state">Loading...</div></div>
+</div>
+
+<!-- Open Positions -->
+<div class="panel full-width">
+  <div class="panel-header"><h2>Open Positions</h2><span class="count" id="op-count">0</span></div>
+  <div class="panel-body">
+    <table><thead><tr><th>Ticker</th><th>Side</th><th>City</th><th>Temp Now</th><th>Day High</th><th>Thresh</th><th>Conf</th><th>Exp</th><th>Qty</th><th>Entry</th><th>Bid</th><th>P&L</th></tr></thead><tbody id="op-tbody"></tbody></table>
+  </div>
+</div>
+
+<!-- Trade History + Hot Markets -->
+<div class="panel">
+  <div class="panel-header"><h2>Recent Trades</h2></div>
+  <div class="panel-body">
+    <table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>City</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="tr-tbody"></tbody></table>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-header"><h2>Hot Markets</h2><span class="count" id="hot-count">0</span></div>
+  <div class="panel-body">
+    <table><thead><tr><th>Market</th><th>Yes</th><th>No</th><th>Vol</th></tr></thead><tbody id="hot-tbody"></tbody></table>
+  </div>
 </div>
 
 </div>
+</div>
 
-<div class="footer">Weather Scalper v1 | Real-time NWS observations | 10s cycles | Near-expiry only</div>
+<div class="status-bar">
+  <span>Weather Scalper | NWS Real-Time Observations | 10s Cycles | Near-Expiry Only</span>
+  <span>Last update: <span id="sb-time">--</span></span>
+</div>
 
 <script>
 const $=s=>document.getElementById(s);
 const pc=v=>v>0?'green':v<0?'red':'gray';
 const fmt=v=>'$'+Math.abs(v).toFixed(2);
-const pf=v=>(v>=0?'+':'')+fmt(v);
+const pf=v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(2);
 
 async function refresh(){
   try{
@@ -898,23 +960,26 @@ async function refresh(){
 
     if(st.mode==='LIVE'){$('mode-dot').className='live-dot dot-live';$('mode-badge').className='mode-badge mode-live';$('mode-badge').textContent='LIVE';}
 
-    const ov=st.overall_pnl||0;
-    const ovp=st.overall_pct||0;
-    $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)} <span style="font-size:20px">(${ovp>=0?'+':''}${ovp}%)</span></span>`;
+    // Hero
+    const ov=st.overall_pnl||0;const ovp=st.overall_pct||0;
+    $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)} <span style="font-size:18px">(${ovp>=0?'+':''}${ovp.toFixed(2)}%)</span></span>`;
     const ur=st.round_pnl||0;const urp=st.round_pct||0;
     $('h-unreal').innerHTML=`<span class="${pc(ur)}">${pf(ur)} (${urp>=0?'+':''}${urp}%)</span>`;
     const re=st.net_pnl||0;
     $('h-real').innerHTML=`<span class="${pc(re)}">${pf(re)}</span>`;
-    $('h-wr').innerHTML=st.win_rate!=null?`<span class="${st.win_rate>50?'green':'red'}">${st.win_rate}%</span>`:'--';
+    $('h-fees').innerHTML=`<span class="gold">$${(st.total_fees||0).toFixed(2)}</span>`;
+    $('h-wr').innerHTML=st.win_rate!=null?`<span class="${st.win_rate>50?'green':st.win_rate>0?'red':'gray'}">${st.win_rate}%</span>`:'--';
     $('h-stations').textContent=st.stations||0;
     $('hd-cycle').textContent=st.cycle||'--';
-    $('s-port').textContent=fmt(st.portfolio||0);
-    $('s-cash').textContent=fmt(st.cash||0);
-    $('s-open').textContent=st.open_count||0;
-    $('s-wins').textContent=st.wins||0;
-    $('s-losses').textContent=st.losses||0;
-    $('s-avgw').textContent=st.avg_win?pf(st.avg_win):'--';
-    $('s-avgl').textContent=st.avg_loss?pf(st.avg_loss):'--';
+
+    // Stats
+    $('st-cash').textContent=fmt(st.cash||0);
+    $('st-posval').textContent=fmt(st.positions_value||0);
+    $('st-record').innerHTML=`<span class="green">${st.wins||0}W</span> / <span class="red">${st.losses||0}L</span>`;
+    $('st-avgw').textContent=st.avg_win?pf(st.avg_win):'--';
+    $('st-avgl').textContent=st.avg_loss?pf(st.avg_loss):'--';
+    $('st-contracts').textContent=st.total_contracts||0;
+    $('st-open').textContent=st.open_count||0;
 
     // Observations
     const obsKeys=Object.keys(obs).sort();
@@ -922,25 +987,29 @@ async function refresh(){
     let oH='<div class="obs-grid">';
     for(const k of obsKeys){
       const o=obs[k];
-      oH+=`<div class="obs-card"><div class="obs-city">${o.name}</div><div class="obs-station">${o.station}</div><div class="obs-temp">${o.temp_f!=null?o.temp_f.toFixed(0)+'°':'--'}</div><div class="obs-detail">High: ${o.day_high_f!=null?o.day_high_f.toFixed(0)+'°':'--'} | Low: ${o.day_low_f!=null?o.day_low_f.toFixed(0)+'°':'--'}</div></div>`;
+      oH+=`<div class="obs-card"><div class="obs-city">${o.name}</div><div class="obs-station">${o.station}</div><div class="obs-temp">${o.temp_f!=null?o.temp_f.toFixed(0)+'°F':'--'}</div><div class="obs-detail">High: ${o.day_high_f!=null?o.day_high_f.toFixed(0)+'°':'--'} Low: ${o.day_low_f!=null?o.day_low_f.toFixed(0)+'°':'--'}</div></div>`;
     }
     oH+='</div>';
-    $('obs-body').innerHTML=oH;
+    $('obs-body').innerHTML=oH||'<div class="empty-state">No observations</div>';
 
-    $('hot-count').textContent=hot.length;
-    $('hot-tbody').innerHTML=hot.map(m=>`<tr><td title="${m.title}">${m.ticker}</td><td>$${m.yes_ask?.toFixed(2)}</td><td>$${m.no_ask?.toFixed(2)}</td><td>${m.volume?.toLocaleString()}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No markets</td></tr>';
-
+    // Positions
     $('op-count').textContent=op.length;
     $('op-tbody').innerHTML=op.map(p=>{
       const cls=pc(p.unrealized);
-      return `<tr><td>${p.ticker}</td><td>${p.side}</td><td class="orange">${p.city}</td><td>${p.current_temp?.toFixed(0)||'?'}°</td><td>${p.day_high?.toFixed(0)||'?'}°</td><td>${p.threshold?.toFixed(0)}°</td><td class="purple">${(p.confidence*100).toFixed(0)}%</td><td>${p.hours_to_expiry?.toFixed(1)}h</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td class="${cls}">${pf(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
-    }).join('')||'<tr><td colspan=11 class="empty">No positions</td></tr>';
+      return `<tr><td>${p.ticker}</td><td>${p.side}</td><td class="gold">${p.city}</td><td>${p.current_temp?.toFixed(0)||'?'}°</td><td>${p.day_high?.toFixed(0)||'?'}°</td><td>${p.threshold?.toFixed(0)}°</td><td class="cyan">${(p.confidence*100).toFixed(0)}%</td><td>${p.hours_to_expiry?.toFixed(1)}h</td><td>x${p.count}</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td class="${cls}">${pf(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
+    }).join('')||'<tr><td colspan=12 class="empty-state">No positions</td></tr>';
 
+    // Trades
     $('tr-tbody').innerHTML=tr.map(t=>{
       const cls=pc(t.pnl);
-      return `<tr><td style="font-size:9px">${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td>${t.side}</td><td class="orange">${t.city}</td><td class="purple">${(t.confidence*100).toFixed(0)}%</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pf(t.pnl)}</td></tr>`;
-    }).join('')||'<tr><td colspan=8 class="empty">No trades yet</td></tr>';
+      return `<tr><td style="font-size:9px">${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td>${t.side}</td><td class="gold">${t.city}</td><td>x${t.count}</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pf(t.pnl)} (${t.gain_pct>0?'+':''}${t.gain_pct}%)</td></tr>`;
+    }).join('')||'<tr><td colspan=8 class="empty-state">No trades yet</td></tr>';
 
+    // Hot
+    $('hot-count').textContent=hot.length;
+    $('hot-tbody').innerHTML=hot.map(m=>`<tr><td title="${m.title}">${m.ticker}</td><td>$${m.yes_ask?.toFixed(2)}</td><td>$${m.no_ask?.toFixed(2)}</td><td>${m.volume?.toLocaleString()}</td></tr>`).join('')||'<tr><td colspan=4 class="empty-state">No markets</td></tr>';
+
+    $('sb-time').textContent=new Date().toLocaleTimeString();
   }catch(e){console.error(e)}
 }
 refresh();setInterval(refresh,5000);
