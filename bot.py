@@ -643,15 +643,24 @@ def api_status():
         total_pnl = sum(sf(t['pnl']) for t in resolved)
         wins = sum(1 for t in resolved if sf(t['pnl']) > 0)
         losses = sum(1 for t in resolved if sf(t['pnl']) <= 0)
+        avg_win = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) > 0) / max(wins, 1), 4)
+        avg_loss = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) <= 0) / max(losses, 1), 4)
+        win_rate = round(wins / max(wins + losses, 1) * 100, 1)
         round_cost = sum(sf(t.get('price')) * (t.get('count') or 1) for t in positions)
         round_pnl = round(pos_val - round_cost, 4)
+        round_pct = round((round_pnl / round_cost * 100), 1) if round_cost > 0 else 0
         overall = round((cash + pos_val) - STARTING_BALANCE, 2)
+        overall_pct = round((overall / STARTING_BALANCE * 100), 2)
 
         return jsonify({
             'portfolio': round(cash + pos_val, 2), 'cash': round(cash, 2),
             'positions_value': round(pos_val, 2), 'overall_pnl': overall,
-            'round_pnl': round_pnl, 'net_pnl': round(total_pnl, 4),
-            'wins': wins, 'losses': losses, 'open_count': len(positions),
+            'overall_pct': overall_pct,
+            'round_pnl': round_pnl, 'round_pct': round_pct,
+            'net_pnl': round(total_pnl, 4),
+            'wins': wins, 'losses': losses, 'win_rate': win_rate,
+            'avg_win': avg_win, 'avg_loss': avg_loss,
+            'open_count': len(positions),
             'mode': "PAPER" if not ENABLE_TRADING else "LIVE",
             'stations': len(current_obs), 'cycle': _cycle,
         })
@@ -842,6 +851,8 @@ tr:hover{background:var(--bg2)}
   <div class="stat"><div class="s-label">Open</div><div class="s-val gold" id="s-open">--</div></div>
   <div class="stat"><div class="s-label">Wins</div><div class="s-val green" id="s-wins">--</div></div>
   <div class="stat"><div class="s-label">Losses</div><div class="s-val red" id="s-losses">--</div></div>
+  <div class="stat"><div class="s-label">Avg Win</div><div class="s-val green" id="s-avgw">--</div></div>
+  <div class="stat"><div class="s-label">Avg Loss</div><div class="s-val red" id="s-avgl">--</div></div>
 </div>
 
 <div class="grid" style="margin-bottom:14px">
@@ -888,11 +899,13 @@ async function refresh(){
     if(st.mode==='LIVE'){$('mode-dot').className='live-dot dot-live';$('mode-badge').className='mode-badge mode-live';$('mode-badge').textContent='LIVE';}
 
     const ov=st.overall_pnl||0;
-    $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)}</span>`;
-    $('h-unreal').innerHTML=`<span class="${pc(st.round_pnl||0)}">${pf(st.round_pnl||0)}</span>`;
-    $('h-real').innerHTML=`<span class="${pc(st.net_pnl||0)}">${pf(st.net_pnl||0)}</span>`;
-    const tot=st.wins+st.losses;
-    $('h-wr').innerHTML=tot>0?`<span class="${st.wins/tot>.5?'green':'red'}">${(st.wins/tot*100).toFixed(1)}%</span>`:'--';
+    const ovp=st.overall_pct||0;
+    $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)} <span style="font-size:20px">(${ovp>=0?'+':''}${ovp}%)</span></span>`;
+    const ur=st.round_pnl||0;const urp=st.round_pct||0;
+    $('h-unreal').innerHTML=`<span class="${pc(ur)}">${pf(ur)} (${urp>=0?'+':''}${urp}%)</span>`;
+    const re=st.net_pnl||0;
+    $('h-real').innerHTML=`<span class="${pc(re)}">${pf(re)}</span>`;
+    $('h-wr').innerHTML=st.win_rate!=null?`<span class="${st.win_rate>50?'green':'red'}">${st.win_rate}%</span>`:'--';
     $('h-stations').textContent=st.stations||0;
     $('hd-cycle').textContent=st.cycle||'--';
     $('s-port').textContent=fmt(st.portfolio||0);
@@ -900,6 +913,8 @@ async function refresh(){
     $('s-open').textContent=st.open_count||0;
     $('s-wins').textContent=st.wins||0;
     $('s-losses').textContent=st.losses||0;
+    $('s-avgw').textContent=st.avg_win?pf(st.avg_win):'--';
+    $('s-avgl').textContent=st.avg_loss?pf(st.avg_loss):'--';
 
     // Observations
     const obsKeys=Object.keys(obs).sort();
