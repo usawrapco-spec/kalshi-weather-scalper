@@ -26,7 +26,7 @@ ENABLE_TRADING = os.environ.get('ENABLE_TRADING', 'false').lower() == 'true'
 
 # === STRATEGY (matches crypto bot) ===
 BUY_MIN = 0.01
-BUY_MAX = 0.99
+BUY_MAX = 0.40               # same as crypto bot — only cheap contracts
 SELL_THRESHOLD = 1.50        # +150%
 CONTRACTS = 1
 MAX_POSITIONS = 50
