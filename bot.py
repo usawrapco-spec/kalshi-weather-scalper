@@ -1,21 +1,16 @@
 """
-Weather Scalper for Kalshi. Buys cheap near-expiry weather contracts
-where the outcome is nearly certain based on real-time NWS observations.
-Same scalping strategy as the crypto bot but for weather.
-
-The edge: current temp at the station already tells us the answer.
-If it's 85F at 3pm in Phoenix and there's a "will it hit 80F?" contract
-at $0.03, that's free money — it already happened.
+Financial Markets Scalper for Kalshi. Buys cheap hourly contracts on
+S&P 500, Nasdaq, Forex (EUR/USD, GBP/USD, USD/JPY, AUD/USD), and WTI Oil.
+Same scalping strategy as the crypto bot — buy cheap near expiry, ride to settlement.
 """
 
-import os, time, logging, traceback, math, re
-from datetime import datetime, timezone, timedelta
+import os, time, logging, traceback, math
+from datetime import datetime, timezone
 from flask import Flask, jsonify
 from threading import Thread
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from kalshi_auth import KalshiAuth
-from realtime import fetch_all_observations, STATIONS
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,67 +24,44 @@ DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://kalshi:kalshi@localh
 PORT = int(os.environ.get('PORT', 8082))
 ENABLE_TRADING = os.environ.get('ENABLE_TRADING', 'false').lower() == 'true'
 
-# === SCALPING STRATEGY ===
-BUY_MIN = 0.01              # buy contracts as cheap as $0.01
-BUY_MAX = 0.50              # don't buy above $0.50
-SELL_THRESHOLD = 1.50        # +150% take profit (like crypto bot)
-CONTRACTS = 100              # contracts per trade
-MAX_POSITIONS = 50           # max open positions
-MAX_PER_TICKER = 3           # max 3 buys on same ticker
-CYCLE_SECONDS = 10           # fast cycles — 10 seconds
-STARTING_BALANCE = 10000.00
-CASH_RESERVE = 0.30
+# === STRATEGY (matches crypto bot) ===
+BUY_MIN = 0.01
+BUY_MAX = 0.99
+SELL_THRESHOLD = 1.50        # +150%
+CONTRACTS = 1
+MAX_POSITIONS = 50
+MAX_PER_SERIES = 99999
+CYCLE_SECONDS = 2            # fast — 2 seconds like crypto bot
+STARTING_BALANCE = 100000.00
+CASH_RESERVE = 0.50
 TAKER_FEE_RATE = 0.07
-MAX_HOURS_TO_EXPIRY = 8      # only buy contracts expiring within 8 hours
-MIN_CONFIDENCE = 0.85         # need 85% confidence the outcome is decided
+MAX_MINS_TO_EXPIRY = 60      # hourly contracts — buy within 60 min
+MAX_BUYS_PER_CYCLE = 1000
 
-# UTC offsets for each city (standard time / daylight time)
-# Used for accurate local hour estimation
-CITY_UTC_OFFSET = {
-    'NYC': -5, 'LGA': -5, 'CHI': -6, 'ORD': -6, 'LA': -8, 'MIA': -5,
-    'DEN': -7, 'ATL': -5, 'DFW': -6, 'DAL': -6, 'SEA': -8, 'PHX': -7,
-    'DCA': -5, 'BOS': -5, 'CLT': -5, 'DTW': -5, 'HOU': -6, 'JAX': -5,
-    'LAS': -8, 'MSP': -6, 'BNA': -6, 'MSY': -6, 'OKC': -6, 'PHL': -5,
-    'AUS': -6, 'SAT': -6, 'SFO': -8, 'TPA': -5, 'BKF': -7,
+# === MARKET SERIES ===
+# Hourly financial markets on Kalshi
+FINANCIAL_SERIES = [
+    # S&P 500
+    'KXINXI', 'KXINXU',
+    # Nasdaq 100
+    'KXNASDAQ100U',
+    # Forex
+    'KXEURUSDH', 'KXGBPUSDH', 'KXAUDUSDH', 'KXUSDJPYH',
+    # Oil
+    'KXWTIH',
+    # Extra crypto hourly (beyond what crypto bot covers)
+    'KXBNB', 'KXBNBD', 'KXHYPE', 'KXHYPED',
+]
+
+SERIES_DISPLAY = {
+    'KXINXI': 'S&P 500', 'KXINXU': 'S&P 500',
+    'KXNASDAQ100U': 'Nasdaq',
+    'KXEURUSDH': 'EUR/USD', 'KXGBPUSDH': 'GBP/USD',
+    'KXAUDUSDH': 'AUD/USD', 'KXUSDJPYH': 'USD/JPY',
+    'KXWTIH': 'WTI Oil',
+    'KXBNB': 'BNB', 'KXBNBD': 'BNB',
+    'KXHYPE': 'HYPE', 'KXHYPED': 'HYPE',
 }
-# DST: Most US cities spring forward (except PHX). Mar-Nov add 1 hour.
-DST_EXEMPT = {'PHX'}  # Arizona doesn't do DST
-
-# All KXHIGH series
-TEMP_SERIES = {
-    'KXHIGHNY': 'NYC', 'KXHIGHLGA': 'LGA',
-    'KXHIGHCHI': 'ORD', 'KXHIGHMDW': 'CHI',
-    'KXHIGHLA': 'LA', 'KXHIGHMIA': 'MIA',
-    'KXHIGHDEN': 'DEN', 'KXHIGHATL': 'ATL',
-    'KXHIGHDFW': 'DFW', 'KXHIGHDAL': 'DAL',
-    'KXHIGHSEA': 'SEA', 'KXHIGHPHX': 'PHX',
-    'KXHIGHDCA': 'DCA', 'KXHIGHBOS': 'BOS',
-    'KXHIGHCLT': 'CLT', 'KXHIGHDTW': 'DTW',
-    'KXHIGHHOU': 'HOU', 'KXHIGHJAX': 'JAX',
-    'KXHIGHLAS': 'LAS', 'KXHIGHMSP': 'MSP',
-    'KXHIGHBNA': 'BNA', 'KXHIGHMSY': 'MSY',
-    'KXHIGHOKC': 'OKC', 'KXHIGHPHL': 'PHL',
-    'KXHIGHAUS': 'AUS', 'KXHIGHSAT': 'SAT',
-    'KXHIGHSFO': 'SFO', 'KXHIGHTPA': 'TPA',
-    'KXHIGHBKF': 'BKF',
-    'NHIGHNY': 'NYC', 'NHIGHLGA': 'LGA',
-    'NHIGHCHI': 'ORD', 'NHIGHMDW': 'CHI',
-    'NHIGHLA': 'LA', 'NHIGHMIA': 'MIA',
-    'NHIGHDEN': 'DEN', 'NHIGHATL': 'ATL',
-    'NHIGHDFW': 'DFW', 'NHIGHDAL': 'DAL',
-    'NHIGHSEA': 'SEA', 'NHIGHPHX': 'PHX',
-    'NHIGHDCA': 'DCA', 'NHIGHBOS': 'BOS',
-    'NHIGHCLT': 'CLT', 'NHIGHDTW': 'DTW',
-    'NHIGHHOU': 'HOU', 'NHIGHJAX': 'JAX',
-    'NHIGHLAS': 'LAS', 'NHIGHMSP': 'MSP',
-    'NHIGHBNA': 'BNA', 'NHIGHMSY': 'MSY',
-    'NHIGHOKC': 'OKC', 'NHIGHPHL': 'PHL',
-    'NHIGHAUS': 'AUS', 'NHIGHSAT': 'SAT',
-    'NHIGHSFO': 'SFO', 'NHIGHTPA': 'TPA',
-    'NHIGHBKF': 'BKF',
-}
-
-ALL_SERIES = list(set(TEMP_SERIES.keys()))
 
 # === DATABASE ===
 
@@ -112,22 +84,14 @@ def init_db():
                     price NUMERIC,
                     count INTEGER,
                     current_bid NUMERIC,
+                    peak_bid NUMERIC,
                     pnl NUMERIC,
-                    city TEXT,
-                    station TEXT,
-                    threshold NUMERIC,
-                    current_temp NUMERIC,
-                    day_high NUMERIC,
-                    confidence NUMERIC,
-                    hours_to_expiry NUMERIC,
+                    series TEXT,
+                    mins_to_expiry NUMERIC,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-            for col, typ in [
-                ('city', 'TEXT'), ('station', 'TEXT'), ('threshold', 'NUMERIC'),
-                ('current_temp', 'NUMERIC'), ('day_high', 'NUMERIC'),
-                ('confidence', 'NUMERIC'), ('hours_to_expiry', 'NUMERIC'),
-            ]:
+            for col, typ in [('series', 'TEXT'), ('mins_to_expiry', 'NUMERIC'), ('peak_bid', 'NUMERIC')]:
                 try:
                     cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
                 except:
@@ -141,7 +105,6 @@ init_db()
 auth = KalshiAuth()
 app = Flask(__name__)
 
-current_obs = {}
 current_hot_markets = []
 
 
@@ -208,6 +171,7 @@ def place_order(ticker, side, action, price, count):
         filled = order.get('place_count', 0) - order.get('remaining_count', 0)
         if filled <= 0:
             filled = count if status in ('executed', 'filled') else 0
+        logger.info(f"ORDER {action.upper()}: {ticker} status={status} filled={filled}/{count}")
         return (order.get('order_id', ''), filled) if filled > 0 else None
     except Exception as e:
         logger.error(f"ORDER FAILED: {action.upper()} {ticker} -- {e}")
@@ -259,217 +223,126 @@ def get_open_positions():
         conn.close()
 
 
-# === LOCAL TIME HELPER ===
-
-def get_local_hour(city_key):
-    """Get approximate local hour for a city, accounting for DST."""
-    now = datetime.now(timezone.utc)
-    offset = CITY_UTC_OFFSET.get(city_key, -6)
-
-    # Simple DST check: second Sunday in March to first Sunday in November
-    month = now.month
-    if city_key not in DST_EXEMPT and 3 <= month <= 10:
-        offset += 1  # DST: spring forward
-
-    local_hour = (now.hour + offset) % 24
-    return local_hour
-
-
-# === SCALPING LOGIC ===
-
-def parse_market(ticker):
-    ticker_upper = ticker.upper()
-    for prefix, city in TEMP_SERIES.items():
-        if ticker_upper.startswith(prefix):
-            match = re.search(r'[BT](\d+\.?\d*)', ticker_upper)
-            if match:
-                return city, float(match.group(1))
-    return None, None
-
-
-def assess_confidence(city_key, threshold, side):
-    """Determine confidence that this contract will settle in our favor.
-
-    Uses real-time observations: if the daily high already exceeded the
-    threshold, "yes above" is a lock. If it's late afternoon and temps
-    are falling well below, "no above" is a lock.
-    """
-    if city_key not in current_obs:
-        return 0.0
-
-    obs = current_obs[city_key]
-    current_temp = obs.get('temp_f')
-    day_high = obs.get('day_high_f')
-
-    if current_temp is None:
-        return 0.0
-
-    local_hour = get_local_hour(city_key)
-
-    if side == 'yes':
-        # Betting the high WILL be >= threshold
-
-        # Already hit today? Lock.
-        if day_high is not None and day_high >= threshold:
-            return 0.99
-
-        # Current temp is above threshold? Very likely.
-        if current_temp >= threshold:
-            return 0.97
-
-        # Close and still warming (before 3pm)
-        if current_temp >= threshold - 2 and local_hour < 15:
-            return 0.88
-
-        # Within 3F and early afternoon
-        if current_temp >= threshold - 3 and local_hour < 14:
-            return 0.80
-
-        # Within 5F and still morning
-        if current_temp >= threshold - 5 and local_hour < 12:
-            return 0.65
-
-        # Late day, hasn't hit, unlikely
-        if local_hour >= 17 and day_high is not None and day_high < threshold - 3:
-            return 0.05
-
-        if local_hour >= 16 and day_high is not None and day_high < threshold:
-            return 0.15
-
-        return 0.3
-
-    else:
-        # Betting the high will NOT reach threshold (side=no)
-
-        # Already hit — we lose
-        if day_high is not None and day_high >= threshold:
-            return 0.01
-
-        if current_temp >= threshold:
-            return 0.02
-
-        # Late afternoon, well below — lock
-        if local_hour >= 16 and current_temp < threshold - 3:
-            return 0.96
-
-        if local_hour >= 17 and current_temp < threshold - 2:
-            return 0.95
-
-        # Past peak, decent buffer
-        if local_hour >= 15 and current_temp < threshold - 4:
-            return 0.90
-
-        # Afternoon, moderate buffer
-        if local_hour >= 14 and current_temp < threshold - 5:
-            return 0.85
-
-        # Early afternoon, big buffer
-        if local_hour >= 13 and current_temp < threshold - 8:
-            return 0.80
-
-        # Morning, too early
-        if local_hour < 12 and current_temp < threshold - 10:
-            return 0.60
-
-        return 0.3
-
+# === SELL LOGIC (same as crypto bot) ===
 
 def check_sells():
     logger.info("--- SELL CHECK ---")
-    positions = get_open_positions()
-    if not positions:
+    open_positions = get_open_positions()
+    if not open_positions:
+        logger.info("No open positions")
         return
 
+    logger.info(f"Checking {len(open_positions)} open positions")
     sold = 0
-    settled = 0
+    expired = 0
 
-    for trade in positions:
+    for trade in open_positions:
         ticker = trade['ticker']
         side = trade['side']
-        entry = sf(trade['price'])
+        entry_price = sf(trade['price'])
         count = trade.get('count') or 1
 
-        if entry <= 0:
+        if entry_price <= 0:
             continue
 
         market = get_market(ticker)
         if not market:
             continue
 
-        result_val = market.get('result', '')
         status = market.get('status', '')
+        result_val = market.get('result', '')
 
-        # Settled
+        # === SETTLED ===
         if result_val:
-            buy_fee = kalshi_fee(entry, count)
+            buy_fee = kalshi_fee(entry_price, count)
             if result_val == side:
                 sell_fee = kalshi_fee(1.0, count)
-                pnl = round((1.0 - entry) * count - buy_fee - sell_fee, 4)
+                pnl = round((1.0 - entry_price) * count - buy_fee - sell_fee, 4)
+                reason = "WIN settled @$1.00"
             else:
-                pnl = round(-entry * count - buy_fee, 4)
-            logger.info(f"SETTLED: {ticker} {side} {'WIN' if pnl > 0 else 'LOSS'} pnl=${pnl:.4f}")
+                pnl = round(-entry_price * count - buy_fee, 4)
+                reason = "LOSS settled"
+            logger.info(f"SETTLED: {ticker} {side} | {reason} | pnl=${pnl:.4f}")
             conn = get_db()
             try:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE trades SET pnl = %s WHERE id = %s", (float(pnl), trade['id']))
+            except Exception as e:
+                logger.error(f"Settle DB error: {e}")
             finally:
                 conn.close()
-            settled += 1
+            expired += 1
             continue
 
         if status in ('closed', 'settled', 'finalized'):
+            logger.info(f"WAITING: {ticker} status={status}, no result yet")
             continue
 
-        # Current bid — only update if > 0
+        # Get current bid
         if side == 'yes':
-            bid = sf(market.get('yes_bid_dollars', '0'))
+            current_bid = sf(market.get('yes_bid_dollars', '0'))
         else:
-            bid = sf(market.get('no_bid_dollars', '0'))
+            current_bid = sf(market.get('no_bid_dollars', '0'))
 
-        if bid > 0:
+        # Update bid and peak in DB
+        if current_bid > 0:
+            current_peak = sf(trade.get('peak_bid') or 0)
+            new_peak = max(current_peak, current_bid)
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE trades SET current_bid = %s WHERE id = %s", (float(bid), trade['id']))
+                    cur.execute("UPDATE trades SET current_bid = %s, peak_bid = %s WHERE id = %s",
+                                (float(current_bid), float(new_peak), trade['id']))
             except:
                 pass
             finally:
                 conn.close()
-        else:
-            bid = sf(trade.get('current_bid', 0))  # keep last known bid
 
-        if bid <= 0:
+        if current_bid <= 0:
+            logger.info(f"SKIP: {ticker} bid=$0, waiting for settlement")
             continue
 
-        gain = (bid - entry) / entry
+        gain = (current_bid - entry_price) / entry_price
+        gain_pct = gain * 100
+
+        logger.info(f"  POS: {ticker} {side} entry=${entry_price:.2f} bid=${current_bid:.2f} {gain_pct:+.0f}% x{count}")
 
         # Take profit
-        if SELL_THRESHOLD and gain >= SELL_THRESHOLD:
-            buy_fee = kalshi_fee(entry, count)
-            sell_fee = kalshi_fee(bid, count)
-            pnl = round((bid - entry) * count - buy_fee - sell_fee, 4)
-            result = place_order(ticker, side, 'sell', bid, count)
-            if result:
-                conn = get_db()
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("UPDATE trades SET pnl = %s, current_bid = %s WHERE id = %s",
-                                    (float(pnl), float(bid), trade['id']))
-                finally:
-                    conn.close()
-                sold += 1
+        if SELL_THRESHOLD is not None and gain >= SELL_THRESHOLD:
+            buy_fee = kalshi_fee(entry_price, count)
+            sell_fee = kalshi_fee(current_bid, count)
+            pnl = round((current_bid - entry_price) * count - buy_fee - sell_fee, 4)
 
-    logger.info(f"SELL: sold={sold} settled={settled}")
+            logger.info(f"SELL: {ticker} {side} x{count} @ ${current_bid:.2f} | pnl=${pnl:.4f}")
+            result = place_order(ticker, side, 'sell', current_bid, count)
+            if not result:
+                continue
+
+            order_id, filled = result
+            if filled < count:
+                pnl = round((current_bid - entry_price) * filled - kalshi_fee(entry_price, filled) - kalshi_fee(current_bid, filled), 4)
+
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE trades SET pnl = %s, current_bid = %s WHERE id = %s",
+                                (float(pnl), float(current_bid), trade['id']))
+            except Exception as e:
+                logger.error(f"Sell DB error: {e}")
+            finally:
+                conn.close()
+            sold += 1
+
+    logger.info(f"SELL SUMMARY: sold={sold} expired={expired}")
 
 
-def fetch_weather_markets():
+# === BUY LOGIC (same as crypto bot) ===
+
+def fetch_all_markets():
     all_markets = []
-    fetched = set()
-    for series in ALL_SERIES:
-        if series in fetched:
-            continue
+    for series in FINANCIAL_SERIES:
+        cursor = None
         try:
-            cursor = None
             while True:
                 url = f'/markets?series_ticker={series}&status=open&limit=200'
                 if cursor:
@@ -480,93 +353,95 @@ def fetch_weather_markets():
                 cursor = resp.get('cursor')
                 if not cursor or not batch:
                     break
-            fetched.add(series)
-        except:
-            pass
-    logger.info(f"Fetched {len(all_markets)} markets")
+        except Exception as e:
+            if '404' not in str(e) and 'not found' not in str(e).lower():
+                logger.error(f"Fetch {series} failed: {e}")
+    logger.info(f"Fetched {len(all_markets)} markets from {len(FINANCIAL_SERIES)} series")
     return all_markets
+
+
+def _get_volume(market):
+    for key in ('volume', 'volume_24h'):
+        val = market.get(key)
+        if val is not None and val != '' and val != 0:
+            try:
+                return int(float(val))
+            except:
+                pass
+    return 0
+
+
+def _get_series(ticker):
+    """Determine which series a ticker belongs to."""
+    for s in FINANCIAL_SERIES:
+        if ticker.upper().startswith(s):
+            return s
+    return ''
 
 
 def buy_candidates(markets):
     balance = get_balance()
-    positions = get_open_positions()
-    logger.info(f"Balance: ${balance:.2f} | {len(positions)} open")
-
-    if len(positions) >= MAX_POSITIONS:
-        return
+    open_positions = get_open_positions()
+    logger.info(f"Balance: ${balance:.2f} | {len(open_positions)} positions open")
 
     deployable = balance * (1.0 - CASH_RESERVE)
     if deployable <= 1.0:
+        logger.info(f"Deployable ${deployable:.2f} too low -- skipping buys")
         return
 
-    now = datetime.now(timezone.utc)
-
-    ticker_counts = {}
-    for t in positions:
-        tk = t.get('ticker', '')
-        ticker_counts[tk] = ticker_counts.get(tk, 0) + 1
-
     candidates = []
+    now = datetime.now(timezone.utc)
 
     for market in markets:
         ticker = market.get('ticker', '')
-        city_key, threshold = parse_market(ticker)
-        if not city_key or not threshold:
-            continue
 
-        if ticker_counts.get(ticker, 0) >= MAX_PER_TICKER:
-            continue
-
-        close_time = market.get('close_time') or market.get('expected_expiration_time', '')
-        if not close_time:
-            continue
-        try:
-            close_dt = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
-            hours_left = (close_dt - now).total_seconds() / 3600
-            if hours_left > MAX_HOURS_TO_EXPIRY or hours_left < 0:
+        # Expiry filter
+        close_time = market.get('close_time') or market.get('expected_expiration_time')
+        if close_time:
+            try:
+                close_dt = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                mins_left = (close_dt - now).total_seconds() / 60
+                if mins_left > MAX_MINS_TO_EXPIRY or mins_left < 0:
+                    continue
+            except:
                 continue
-        except:
+        else:
             continue
 
         yes_ask = float(market.get('yes_ask_dollars') or '999')
+        yes_bid = float(market.get('yes_bid_dollars') or '0')
         no_ask = float(market.get('no_ask_dollars') or '999')
+        no_bid = float(market.get('no_bid_dollars') or '0')
 
-        for side, ask in [('yes', yes_ask), ('no', no_ask)]:
-            if not (BUY_MIN <= ask <= BUY_MAX):
-                continue
+        series = _get_series(ticker)
 
-            confidence = assess_confidence(city_key, threshold, side)
-            if confidence < MIN_CONFIDENCE:
-                continue
+        # Buy cheapest side in range
+        if yes_ask <= no_ask and BUY_MIN <= yes_ask <= BUY_MAX and yes_bid > 0:
+            side, price, bid = 'yes', yes_ask, yes_bid
+        elif BUY_MIN <= no_ask <= BUY_MAX and no_bid > 0:
+            side, price, bid = 'no', no_ask, no_bid
+        elif BUY_MIN <= yes_ask <= BUY_MAX and yes_bid > 0:
+            side, price, bid = 'yes', yes_ask, yes_bid
+        else:
+            continue
 
-            obs = current_obs.get(city_key, {})
-            candidates.append({
-                'ticker': ticker, 'side': side, 'price': ask,
-                'confidence': confidence, 'city': city_key,
-                'station': STATIONS.get(city_key, {}).get('icao', ''),
-                'threshold': threshold,
-                'current_temp': obs.get('temp_f', 0),
-                'day_high': obs.get('day_high_f', 0),
-                'hours_left': hours_left,
-            })
+        candidates.append({
+            'ticker': ticker, 'side': side, 'price': price, 'bid': bid,
+            'series': series, 'mins_left': mins_left,
+        })
 
-    candidates.sort(key=lambda x: (x['price'], -x['confidence']))
-    logger.info(f"Found {len(candidates)} scalp candidates (>={MIN_CONFIDENCE*100:.0f}% confidence)")
+    candidates.sort(key=lambda x: x['price'])
+    candidates = candidates[:MAX_BUYS_PER_CYCLE]
+    logger.info(f"Found {len(candidates)} buy candidates")
 
     bought = 0
     for c in candidates:
-        if len(positions) + bought >= MAX_POSITIONS:
+        if bought >= MAX_BUYS_PER_CYCLE:
             break
 
         cost = c['price'] * CONTRACTS
         if cost > deployable:
             continue
-
-        logger.info(
-            f"SCALP: {c['ticker']} {c['side']} x{CONTRACTS} @ ${c['price']:.2f} | "
-            f"conf={c['confidence']:.0%} temp={c['current_temp']:.0f}F high={c['day_high']:.0f}F "
-            f"thresh={c['threshold']:.0f}F {c['city']}({c['station']}) exp={c['hours_left']:.1f}h"
-        )
 
         result = place_order(c['ticker'], c['side'], 'buy', c['price'], CONTRACTS)
         if not result:
@@ -576,39 +451,36 @@ def buy_candidates(markets):
         if filled <= 0:
             continue
 
+        logger.info(f"BUY: {c['ticker']} {c['side']} x{filled} @ ${c['price']:.2f} mins_left={c['mins_left']:.0f}")
         conn = get_db()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO trades
-                       (ticker, side, action, price, count, current_bid, city, station,
-                        threshold, current_temp, day_high, confidence, hours_to_expiry)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    "INSERT INTO trades (ticker, side, action, price, count, current_bid, series, mins_to_expiry) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                     (c['ticker'], c['side'], 'buy', float(c['price']), filled,
-                     float(c['price']), c['city'], c['station'],
-                     float(c['threshold']), float(c['current_temp']),
-                     float(c['day_high'] or 0), float(c['confidence']),
-                     round(c['hours_left'], 2))
+                     float(c['bid']), c.get('series', ''), round(c.get('mins_left', 0), 1))
                 )
         except Exception as e:
-            logger.error(f"DB insert failed: {e}")
+            logger.error(f"Buy DB insert failed: {e}")
         finally:
             conn.close()
 
         deployable -= cost
         bought += 1
 
-    logger.info(f"Scalped {bought} positions")
+    logger.info(f"Bought {bought} positions")
 
 
 def update_hot_markets(markets):
     global current_hot_markets
     active = [m for m in markets if sf(m.get('yes_ask_dollars', '0')) < 0.99]
-    by_vol = sorted(active, key=lambda m: int(m.get('volume', 0) or 0), reverse=True)[:15]
+    by_vol = sorted(active, key=lambda m: _get_volume(m), reverse=True)[:15]
     current_hot_markets = [
-        {'ticker': m.get('ticker', ''), 'title': (m.get('subtitle', '') or m.get('title', ''))[:60],
-         'yes_ask': sf(m.get('yes_ask_dollars', '0')), 'no_ask': sf(m.get('no_ask_dollars', '0')),
-         'volume': int(m.get('volume', 0) or 0)}
+        {'ticker': m.get('ticker', ''),
+         'title': (m.get('subtitle', '') or m.get('title', ''))[:50],
+         'yes_ask': sf(m.get('yes_ask_dollars', '0')),
+         'no_ask': sf(m.get('no_ask_dollars', '0')),
+         'volume': _get_volume(m)}
         for m in by_vol
     ]
 
@@ -618,22 +490,14 @@ def update_hot_markets(markets):
 _cycle = 0
 
 def run_cycle():
-    global current_obs, _cycle
+    global _cycle
     _cycle += 1
-
     mode = "PAPER" if not ENABLE_TRADING else "LIVE"
     balance = get_balance()
     logger.info(f"=== CYCLE {_cycle} [{mode}] === Balance: ${balance:.2f}")
 
-    # Refresh observations every 6 cycles (~60 sec)
-    if _cycle % 6 == 1 or not current_obs:
-        logger.info("Fetching real-time NWS observations...")
-        current_obs = fetch_all_observations()
-        for city, obs in sorted(current_obs.items()):
-            logger.info(f"  {city}({obs.get('station','?')}): now={obs.get('temp_f', '?')}F high={obs.get('day_high_f', '?')}F")
-
     check_sells()
-    markets = fetch_weather_markets()
+    markets = fetch_all_markets()
     update_hot_markets(markets)
     buy_candidates(markets)
 
@@ -641,7 +505,7 @@ def run_cycle():
     logger.info(f"=== CYCLE END [{mode}] === Balance: ${balance:.2f}")
 
 
-# === DASHBOARD API ===
+# === API ===
 
 @app.route('/')
 def health():
@@ -654,11 +518,12 @@ def api_status():
         cash = get_balance()
         positions = get_open_positions()
         pos_val = sum(sf(t.get('current_bid', 0)) * (t.get('count') or 1) for t in positions)
+        portfolio = cash + pos_val
 
         conn = get_db()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT pnl FROM trades WHERE action='buy' AND pnl IS NOT NULL")
+                cur.execute("SELECT pnl, count FROM trades WHERE action = 'buy' AND pnl IS NOT NULL")
                 resolved = cur.fetchall()
                 cur.execute("SELECT count, price FROM trades WHERE action = 'buy'")
                 all_buys = cur.fetchall()
@@ -671,17 +536,19 @@ def api_status():
         win_rate = round(wins / max(wins + losses, 1) * 100, 1)
         avg_win = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) > 0) / max(wins, 1), 4)
         avg_loss = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) <= 0) / max(losses, 1), 4)
+        win_pnl = sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) > 0)
         total_contracts = sum((t.get('count') or 1) for t in all_buys)
         total_fees = round(sum(kalshi_fee(sf(t.get('price')), t.get('count') or 1) for t in all_buys), 4)
 
         round_cost = sum(sf(t.get('price')) * (t.get('count') or 1) for t in positions)
         round_pnl = round(pos_val - round_cost, 4)
         round_pct = round((round_pnl / round_cost * 100), 1) if round_cost > 0 else 0
-        overall = round((cash + pos_val) - STARTING_BALANCE, 2)
+        overall = round(portfolio - STARTING_BALANCE, 2)
         overall_pct = round((overall / STARTING_BALANCE * 100), 2)
+        mode = "PAPER" if not ENABLE_TRADING else "LIVE"
 
         return jsonify({
-            'portfolio': round(cash + pos_val, 2), 'cash': round(cash, 2),
+            'portfolio': round(portfolio, 2), 'cash': round(cash, 2),
             'positions_value': round(pos_val, 2),
             'overall_pnl': overall, 'overall_pct': overall_pct,
             'round_pnl': round_pnl, 'round_pct': round_pct,
@@ -689,9 +556,7 @@ def api_status():
             'total_contracts': total_contracts,
             'wins': wins, 'losses': losses, 'win_rate': win_rate,
             'avg_win': avg_win, 'avg_loss': avg_loss,
-            'open_count': len(positions),
-            'mode': "PAPER" if not ENABLE_TRADING else "LIVE",
-            'stations': len(current_obs), 'cycle': _cycle,
+            'open_count': len(positions), 'mode': mode, 'cycle': _cycle,
         })
     except Exception as e:
         logger.error(f"API status error: {e}")
@@ -706,22 +571,26 @@ def api_open():
             price = sf(t.get('price'))
             current = sf(t.get('current_bid'))
             count = int(t.get('count') or 1)
-            unrealized = round((current - price) * count, 4) if price > 0 and current > 0 else 0
-            gain_pct = round(((current - price) / price) * 100, 1) if price > 0 and current > 0 else 0
+            if price > 0 and current > 0:
+                unrealized = round((current - price) * count, 4)
+                gain_pct = round(((current - price) / price) * 100, 1)
+            else:
+                unrealized = 0
+                gain_pct = 0
+            series = t.get('series', '')
+            display = SERIES_DISPLAY.get(series, series)
             positions.append({
                 'ticker': t.get('ticker', ''), 'side': t.get('side', ''),
-                'city': t.get('city', ''), 'station': t.get('station', ''),
-                'threshold': sf(t.get('threshold')),
-                'current_temp': sf(t.get('current_temp')),
-                'day_high': sf(t.get('day_high')),
-                'confidence': sf(t.get('confidence')),
-                'hours_to_expiry': sf(t.get('hours_to_expiry')),
+                'market': display, 'series': series,
                 'count': count, 'entry': price, 'current_bid': current,
+                'peak_bid': sf(t.get('peak_bid', 0)),
                 'unrealized': unrealized, 'gain_pct': gain_pct,
+                'mins_to_expiry': sf(t.get('mins_to_expiry')),
             })
         positions.sort(key=lambda x: x['gain_pct'], reverse=True)
         return jsonify(positions)
-    except:
+    except Exception as e:
+        logger.error(f"API open error: {e}")
         return jsonify([])
 
 
@@ -731,42 +600,34 @@ def api_trades():
         conn = get_db()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM trades WHERE action='buy' AND pnl IS NOT NULL ORDER BY created_at DESC LIMIT 50")
+                cur.execute("SELECT * FROM trades WHERE action = 'buy' AND pnl IS NOT NULL ORDER BY created_at DESC LIMIT 50")
                 data = cur.fetchall()
         finally:
             conn.close()
-        return jsonify([{
-            'created_at': str(t.get('created_at', '')), 'ticker': t.get('ticker', ''),
-            'side': t.get('side', ''), 'city': t.get('city', ''),
-            'confidence': sf(t.get('confidence')),
-            'count': t.get('count', 1),
-            'entry': sf(t.get('price')), 'exit': sf(t.get('current_bid')),
-            'pnl': sf(t.get('pnl')),
-            'gain_pct': round(((sf(t.get('current_bid')) - sf(t.get('price'))) / sf(t.get('price'))) * 100, 1) if sf(t.get('price')) > 0 else 0,
-        } for t in data])
-    except:
+        trades = []
+        for t in data:
+            entry = sf(t.get('price'))
+            exit_price = sf(t.get('current_bid'))
+            gain_pct = round(((exit_price - entry) / entry) * 100, 1) if entry > 0 else 0
+            series = t.get('series', '')
+            trades.append({
+                'created_at': str(t.get('created_at', '')),
+                'ticker': t.get('ticker', ''),
+                'side': t.get('side', ''),
+                'market': SERIES_DISPLAY.get(series, series),
+                'count': t.get('count', 1),
+                'entry': entry, 'exit': exit_price,
+                'pnl': sf(t.get('pnl')), 'gain_pct': gain_pct,
+            })
+        return jsonify(trades)
+    except Exception as e:
+        logger.error(f"API trades error: {e}")
         return jsonify([])
 
 
 @app.route('/api/hot')
 def api_hot():
     return jsonify(current_hot_markets)
-
-
-@app.route('/api/observations')
-def api_observations():
-    result = {}
-    for city, obs in current_obs.items():
-        result[city] = {
-            'name': STATIONS.get(city, {}).get('name', city),
-            'station': obs.get('station', ''),
-            'temp_f': obs.get('temp_f'),
-            'day_high_f': obs.get('day_high_f'),
-            'day_low_f': obs.get('day_low_f'),
-            'wind_mph': obs.get('wind_mph'),
-            'observed_at': obs.get('observed_at', ''),
-        }
-    return jsonify(result)
 
 
 @app.route('/dashboard')
@@ -779,7 +640,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Weather Scalper Terminal</title>
+<title>Financial Scalper Terminal</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}
@@ -789,12 +650,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   --text:#c8d0e0;--text2:#6a7490;--text3:#3a4260;
   --green:#00e68a;--green2:#00cc7a;--green-bg:rgba(0,230,138,.06);
   --red:#ff4466;--red2:#ee3355;--red-bg:rgba(255,68,102,.06);
-  --gold:#f0b040;--gold2:#e0a030;--gold-bg:rgba(240,176,64,.08);
+  --gold:#f0b040;--gold2:#e0a030;
   --blue:#4488ff;--cyan:#40d0e0;
 }
 body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 .animate-num{transition:all .4s cubic-bezier(.4,0,.2,1)}
 
 .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;animation:pulse 1.8s ease-in-out infinite;vertical-align:middle}
@@ -831,7 +691,6 @@ body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospa
 .stat-card.accent-red::after{background:var(--red)}
 .stat-card.accent-gold::after{background:var(--gold)}
 .stat-card.accent-blue::after{background:var(--blue)}
-.stat-card.accent-cyan::after{background:var(--cyan)}
 .stat-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 .stat-value{font-size:15px;font-weight:700}
 
@@ -852,13 +711,6 @@ tr{transition:background .15s ease}
 tr:hover{background:var(--bg3) !important}
 .green{color:var(--green)}.red{color:var(--red)}.gray{color:var(--text3)}.gold{color:var(--gold)}.cyan{color:var(--cyan)}
 
-.obs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;padding:12px}
-.obs-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
-.obs-city{font-size:10px;font-weight:700;color:var(--gold)}
-.obs-station{font-size:8px;color:var(--text3)}
-.obs-temp{font-size:20px;font-weight:800;color:var(--red);margin:2px 0}
-.obs-detail{font-size:9px;color:var(--text2)}
-
 .status-bar{background:var(--bg1);border-top:1px solid var(--border);padding:8px 24px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:10px;color:var(--text3)}
 .empty-state{color:var(--text3);text-align:center;padding:24px;font-size:11px;font-style:italic}
 </style>
@@ -867,14 +719,14 @@ tr:hover{background:var(--bg3) !important}
 
 <div class="header-bar">
   <div class="header-left">
-    <span class="brand">Weather Scalper</span>
+    <span class="brand">Financial Scalper</span>
     <span class="live-dot dot-paper" id="mode-dot"></span>
     <span class="mode-badge mode-paper" id="mode-badge">PAPER MODE</span>
   </div>
   <div class="header-right">
-    <span>Buy $0.01 - $0.50</span><span>|</span>
+    <span>S&P 500 | Nasdaq | Forex | Oil</span><span>|</span>
+    <span>Buy $0.01 - $0.99</span><span>|</span>
     <span>Sell +150%</span><span>|</span>
-    <span>Confidence >= 85%</span><span>|</span>
     <span>Cycle: <span class="countdown-box" id="hd-cycle">--</span></span>
   </div>
 </div>
@@ -887,9 +739,8 @@ tr:hover{background:var(--bg3) !important}
   <div class="hero-sub">
     <div class="hero-sub-item"><div class="hero-sub-label">Unrealized</div><div class="hero-sub-value animate-num" id="h-unreal">...</div></div>
     <div class="hero-sub-item"><div class="hero-sub-label">Realized</div><div class="hero-sub-value animate-num" id="h-real">...</div></div>
-    <div class="hero-sub-item"><div class="hero-sub-label">Total Fees</div><div class="hero-sub-value animate-num" id="h-fees">...</div></div>
+    <div class="hero-sub-item"><div class="hero-sub-label">Fees Paid</div><div class="hero-sub-value animate-num" id="h-fees">...</div></div>
     <div class="hero-sub-item"><div class="hero-sub-label">Win Rate</div><div class="hero-sub-value animate-num" id="h-wr">...</div></div>
-    <div class="hero-sub-item"><div class="hero-sub-label">Stations</div><div class="hero-sub-value animate-num cyan" id="h-stations">...</div></div>
   </div>
 </div>
 
@@ -899,31 +750,23 @@ tr:hover{background:var(--bg3) !important}
   <div class="stat-card accent-green"><div class="stat-label">Record</div><div class="stat-value" id="st-record">--</div></div>
   <div class="stat-card accent-green"><div class="stat-label">Avg Win</div><div class="stat-value green" id="st-avgw">--</div></div>
   <div class="stat-card accent-red"><div class="stat-label">Avg Loss</div><div class="stat-value red" id="st-avgl">--</div></div>
-  <div class="stat-card accent-cyan"><div class="stat-label">Contracts</div><div class="stat-value cyan" id="st-contracts">--</div></div>
+  <div class="stat-card accent-blue"><div class="stat-label">Contracts</div><div class="stat-value" id="st-contracts">--</div></div>
   <div class="stat-card accent-gold"><div class="stat-label">Open</div><div class="stat-value" id="st-open">--</div></div>
 </div>
 
 <div class="grid-layout">
 
-<!-- Live Observations -->
-<div class="panel full-width">
-  <div class="panel-header"><h2>Live Station Observations</h2><span class="count" id="obs-count">--</span></div>
-  <div class="panel-body" style="max-height:300px" id="obs-body"><div class="empty-state">Loading...</div></div>
-</div>
-
-<!-- Open Positions -->
 <div class="panel full-width">
   <div class="panel-header"><h2>Open Positions</h2><span class="count" id="op-count">0</span></div>
   <div class="panel-body">
-    <table><thead><tr><th>Ticker</th><th>Side</th><th>City</th><th>Temp Now</th><th>Day High</th><th>Thresh</th><th>Conf</th><th>Exp</th><th>Qty</th><th>Entry</th><th>Bid</th><th>P&L</th></tr></thead><tbody id="op-tbody"></tbody></table>
+    <table><thead><tr><th>Ticker</th><th>Market</th><th>Side</th><th>Qty</th><th>Entry</th><th>Bid</th><th>Peak</th><th>P&L</th></tr></thead><tbody id="op-tbody"></tbody></table>
   </div>
 </div>
 
-<!-- Trade History + Hot Markets -->
 <div class="panel">
   <div class="panel-header"><h2>Recent Trades</h2></div>
   <div class="panel-body">
-    <table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>City</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="tr-tbody"></tbody></table>
+    <table><thead><tr><th>Time</th><th>Ticker</th><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="tr-tbody"></tbody></table>
   </div>
 </div>
 
@@ -938,8 +781,8 @@ tr:hover{background:var(--bg3) !important}
 </div>
 
 <div class="status-bar">
-  <span>Weather Scalper | NWS Real-Time Observations | 10s Cycles | Near-Expiry Only</span>
-  <span>Last update: <span id="sb-time">--</span></span>
+  <span>Financial Scalper | S&P 500 + Nasdaq + Forex + Oil | Hourly Contracts | 2s Cycles</span>
+  <span>Last: <span id="sb-time">--</span></span>
 </div>
 
 <script>
@@ -950,29 +793,24 @@ const pf=v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(2);
 
 async function refresh(){
   try{
-    const [st,op,tr,hot,obs]=await Promise.all([
+    const [st,op,tr,hot]=await Promise.all([
       fetch('/api/status').then(r=>r.json()),
       fetch('/api/open').then(r=>r.json()),
       fetch('/api/trades').then(r=>r.json()),
       fetch('/api/hot').then(r=>r.json()),
-      fetch('/api/observations').then(r=>r.json()),
     ]);
 
     if(st.mode==='LIVE'){$('mode-dot').className='live-dot dot-live';$('mode-badge').className='mode-badge mode-live';$('mode-badge').textContent='LIVE';}
 
-    // Hero
     const ov=st.overall_pnl||0;const ovp=st.overall_pct||0;
     $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)} <span style="font-size:18px">(${ovp>=0?'+':''}${ovp.toFixed(2)}%)</span></span>`;
     const ur=st.round_pnl||0;const urp=st.round_pct||0;
     $('h-unreal').innerHTML=`<span class="${pc(ur)}">${pf(ur)} (${urp>=0?'+':''}${urp}%)</span>`;
-    const re=st.net_pnl||0;
-    $('h-real').innerHTML=`<span class="${pc(re)}">${pf(re)}</span>`;
+    $('h-real').innerHTML=`<span class="${pc(st.net_pnl||0)}">${pf(st.net_pnl||0)}</span>`;
     $('h-fees').innerHTML=`<span class="gold">$${(st.total_fees||0).toFixed(2)}</span>`;
     $('h-wr').innerHTML=st.win_rate!=null?`<span class="${st.win_rate>50?'green':st.win_rate>0?'red':'gray'}">${st.win_rate}%</span>`:'--';
-    $('h-stations').textContent=st.stations||0;
     $('hd-cycle').textContent=st.cycle||'--';
 
-    // Stats
     $('st-cash').textContent=fmt(st.cash||0);
     $('st-posval').textContent=fmt(st.positions_value||0);
     $('st-record').innerHTML=`<span class="green">${st.wins||0}W</span> / <span class="red">${st.losses||0}L</span>`;
@@ -981,31 +819,17 @@ async function refresh(){
     $('st-contracts').textContent=st.total_contracts||0;
     $('st-open').textContent=st.open_count||0;
 
-    // Observations
-    const obsKeys=Object.keys(obs).sort();
-    $('obs-count').textContent=obsKeys.length+' stations';
-    let oH='<div class="obs-grid">';
-    for(const k of obsKeys){
-      const o=obs[k];
-      oH+=`<div class="obs-card"><div class="obs-city">${o.name}</div><div class="obs-station">${o.station}</div><div class="obs-temp">${o.temp_f!=null?o.temp_f.toFixed(0)+'°F':'--'}</div><div class="obs-detail">High: ${o.day_high_f!=null?o.day_high_f.toFixed(0)+'°':'--'} Low: ${o.day_low_f!=null?o.day_low_f.toFixed(0)+'°':'--'}</div></div>`;
-    }
-    oH+='</div>';
-    $('obs-body').innerHTML=oH||'<div class="empty-state">No observations</div>';
-
-    // Positions
     $('op-count').textContent=op.length;
     $('op-tbody').innerHTML=op.map(p=>{
       const cls=pc(p.unrealized);
-      return `<tr><td>${p.ticker}</td><td>${p.side}</td><td class="gold">${p.city}</td><td>${p.current_temp?.toFixed(0)||'?'}°</td><td>${p.day_high?.toFixed(0)||'?'}°</td><td>${p.threshold?.toFixed(0)}°</td><td class="cyan">${(p.confidence*100).toFixed(0)}%</td><td>${p.hours_to_expiry?.toFixed(1)}h</td><td>x${p.count}</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td class="${cls}">${pf(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
-    }).join('')||'<tr><td colspan=12 class="empty-state">No positions</td></tr>';
+      return `<tr><td>${p.ticker}</td><td class="gold">${p.market||''}</td><td>${p.side}</td><td>x${p.count}</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td>$${p.peak_bid?.toFixed(2)||'--'}</td><td class="${cls}">${pf(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
+    }).join('')||'<tr><td colspan=8 class="empty-state">No positions</td></tr>';
 
-    // Trades
     $('tr-tbody').innerHTML=tr.map(t=>{
       const cls=pc(t.pnl);
-      return `<tr><td style="font-size:9px">${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td>${t.side}</td><td class="gold">${t.city}</td><td>x${t.count}</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pf(t.pnl)} (${t.gain_pct>0?'+':''}${t.gain_pct}%)</td></tr>`;
-    }).join('')||'<tr><td colspan=8 class="empty-state">No trades yet</td></tr>';
+      return `<tr><td style="font-size:9px">${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td class="gold">${t.market||''}</td><td>${t.side}</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pf(t.pnl)} (${t.gain_pct>0?'+':''}${t.gain_pct}%)</td></tr>`;
+    }).join('')||'<tr><td colspan=7 class="empty-state">No trades yet</td></tr>';
 
-    // Hot
     $('hot-count').textContent=hot.length;
     $('hot-tbody').innerHTML=hot.map(m=>`<tr><td title="${m.title}">${m.ticker}</td><td>$${m.yes_ask?.toFixed(2)}</td><td>$${m.no_ask?.toFixed(2)}</td><td>${m.volume?.toLocaleString()}</td></tr>`).join('')||'<tr><td colspan=4 class="empty-state">No markets</td></tr>';
 
@@ -1020,10 +844,11 @@ refresh();setInterval(refresh,5000);
 
 def bot_loop():
     mode = "PAPER" if not ENABLE_TRADING else "LIVE"
-    logger.info(f"=== WEATHER SCALPER [{mode}] ===")
-    logger.info(f"Buy ${BUY_MIN}-${BUY_MAX}, sell +{SELL_THRESHOLD*100:.0f}%, {CONTRACTS} contracts")
-    logger.info(f"Min confidence {MIN_CONFIDENCE*100:.0f}%, max {MAX_HOURS_TO_EXPIRY}h to expiry")
-    logger.info(f"Tracking {len(STATIONS)} NWS stations, {CYCLE_SECONDS}s cycles")
+    sell_str = f"+{SELL_THRESHOLD*100:.0f}%" if SELL_THRESHOLD else "settlement"
+    logger.info(f"=== FINANCIAL SCALPER [{mode}] ===")
+    logger.info(f"Buy ${BUY_MIN}-${BUY_MAX}, sell {sell_str}, {CONTRACTS} contracts, {CASH_RESERVE*100:.0f}% reserve")
+    logger.info(f"Series: {FINANCIAL_SERIES}")
+    logger.info(f"Markets: S&P 500, Nasdaq, EUR/USD, GBP/USD, AUD/USD, USD/JPY, WTI Oil, BNB, HYPE")
 
     while True:
         try:
